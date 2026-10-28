@@ -50,7 +50,10 @@ body{background:var(--bg);color:var(--ink);font-family:var(--body);font-size:15p
 .wrap{max-width:1280px;margin:0 auto;padding-inline:16px;padding-block:24px 72px}
 
 h1{font-family:var(--display);font-size:clamp(23px,3.2vw,31px);font-weight:700;
-  letter-spacing:-.025em;margin:0 0 16px;text-wrap:balance}
+  letter-spacing:-.025em;margin:0;text-wrap:balance}
+.hdr{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 0 16px}
+.hdr .mini{padding:5px 11px;font-size:12px}
+html{scroll-behavior:smooth}
 .lede{color:var(--ink-dim);font-size:13.5px;margin:7px 0 20px;max-width:70ch}
 
 /* key bar */
@@ -87,9 +90,27 @@ button:disabled{opacity:.5;cursor:default}
 .tab .r svg{width:13px;height:13px;display:block}
 .tab.busy .r{animation:spin .9s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-.toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px;font-size:12.5px;
+.toolbar{display:flex;flex-direction:column;gap:7px;margin-bottom:14px;font-size:12.5px;
+  position:sticky;top:0;z-index:6;background:var(--bg);padding:8px 0 7px;box-shadow:0 1px 0 var(--line);
   color:var(--ink-faint)}
+.toolbar .tb-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .toolbar .spacer{flex:1}
+.jump a{font-size:11.5px;text-decoration:none;color:var(--ink-dim);border:1px solid var(--line);border-radius:999px;
+  padding:3px 10px;background:var(--surface)}
+.jump a:hover{color:var(--accent);border-color:var(--accent)}
+.group,.topgrid{scroll-margin-top:110px}
+.tblbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 12px;border-bottom:1px solid var(--line)}
+.tblbar input{flex:1 1 220px;min-width:0;font:inherit;font-size:12.5px;padding:6px 9px;border:1px solid var(--line);
+  border-radius:7px;background:var(--surface-2);color:var(--ink)}
+.chips{display:flex;gap:4px}
+.chip{font-size:11px;padding:3px 9px;border-radius:999px;border:1px solid var(--line);background:none;color:var(--ink-dim);cursor:pointer}
+.chip.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+.tblbar .cnt{font-size:11.5px;color:var(--ink-faint);margin-left:auto}
+.scroll.tall{max-height:460px}
+.tfoot{display:flex;gap:14px;flex-wrap:wrap;padding:9px 12px;font-size:12px;color:var(--ink-dim);border-top:1px solid var(--line)}
+.tfoot b{color:var(--ink)}
+.clr{font-size:11px;color:var(--ink-faint);white-space:nowrap}
+.nw{white-space:nowrap}
 .toolbar button{padding:7px 13px;font-size:12.5px}
 .toolbar .fail{color:var(--bad)}
 .toolbar .keyfp{font-family:var(--mono);font-size:12px;color:var(--ink);background:var(--surface);
@@ -228,7 +249,8 @@ dl.kv dd{margin:0;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 </head>
 <body>
 <div class="wrap">
-  <h1>Stripe Console</h1>
+  <div class="hdr"><h1>Stripe Console</h1>
+    <button type="button" id="theme" class="mini" title="Switch between light and dark">Theme</button></div>
 
   <form class="keybar" id="form" autocomplete="off">
     <input id="key" type="password" required autocomplete="off" autocorrect="off"
@@ -307,7 +329,7 @@ const CALLS = since => ({
   account:   ["account"],
   balance:   ["balance"],
   btx:       ["balance_transactions", {limit:100}],
-  charges:   ["charges", {limit:100, "created[gte]":since}],
+  charges:   ["charges", {limit:100, "created[gte]":since, "expand[]":"data.balance_transaction"}],
   payouts:   ["payouts", {limit:10}],
   disputes:  ["disputes", {limit:25}],
   efw:       ["radar/early_fraud_warnings", {limit:25}],
@@ -460,6 +482,16 @@ function derive(key, days, D, ERR){
   const ext = (a.external_accounts && a.external_accounts.data) || [];
   const bank = ext.find(e => e.object === "bank_account") || ext[0] || null;
 
+  // settlement totals of succeeded charges in the window, in the currency Stripe settled them in
+  const btOf = c => (c.balance_transaction && typeof c.balance_transaction === "object") ? c.balance_transaction : null;
+  const settleMap = {};
+  for (const c of succ){
+    const bt = btOf(c); if (!bt) continue;
+    const r = settleMap[bt.currency] || (settleMap[bt.currency] = {currency:bt.currency, gross:0, fee:0, net:0, count:0});
+    r.gross += bt.amount||0; r.fee += bt.fee||0; r.net += bt.net||0; r.count++;
+  }
+  const settled = Object.values(settleMap).sort((x,y) => y.net - x.net);
+
   return {
     key: key.slice(0,11) + "…", days,
     fp: fingerprint(key),
@@ -486,7 +518,7 @@ function derive(key, days, D, ERR){
     available: (D.balance && D.balance.available) || [],
     pending: (D.balance && D.balance.pending) || [],
     reserved: (D.balance && D.balance.connect_reserved) || [],
-    byCurrency, fees, converted, convertedTotal, clearing, observedDays,
+    byCurrency, fees, converted, convertedTotal, clearing, observedDays, settled,
     counts: {
       total: charges.length, hasMore: !!(D.charges && D.charges.has_more),
       succeeded: succ.length, failed: failed.length,
@@ -495,8 +527,11 @@ function derive(key, days, D, ERR){
     },
     declines, chase, aov, buyers, repeat,
     brands: share(brandMap), countries: share(countryMap), hours,
-    recent: charges.slice(0,25).map(c => ({
+    recent: charges.slice(0,50).map(c => { const bt = btOf(c); return {
       id:c.id,
+      // what Stripe actually settled for this payment: fee, net and clearing date, in the settlement currency
+      settle: bt ? {on:bt.available_on, status:bt.status, gross:bt.amount||0, fee:bt.fee||0, net:bt.net||0,
+                    currency:bt.currency, rate:bt.exchange_rate||null} : null,
       refundable: Math.max(0, (c.amount||0) - (c.amount_refunded||0)),
       created:c.created,
       state: c.disputed ? "disputed"
@@ -506,7 +541,7 @@ function derive(key, days, D, ERR){
       who:(c.billing_details&&c.billing_details.email)||c.receipt_email||(c.billing_details&&c.billing_details.name)||"—",
       brand:(c.payment_method_details&&c.payment_method_details.card&&c.payment_method_details.card.brand)||"",
       note:c.description||c.failure_message||""
-    })),
+    }; }),
     payouts: list("payouts").map(p => ({id:p.id, arrival:p.arrival_date, amount:p.amount||0, currency:p.currency,
       status:p.status, failure:p.failure_message, method:p.method})),
     disputes: disputes.map(d => ({amount:d.amount, currency:d.currency, reason:d.reason, status:d.status,
@@ -620,7 +655,8 @@ function kpis(A){
   return `<div class="kpis">
     ${k("Available", esc(sumList(A.available)), "ready to pay out")}
     ${k("Pending", esc(sumList(A.pending)), A.observedDays != null ? `clears in ~${A.observedDays}d` : "still settling")}
-    ${k("Net · "+A.days+"d", esc(net), `${A.counts.succeeded} payment${A.counts.succeeded===1?"":"s"}`)}
+    ${k("Net · "+A.days+"d", esc(net), `${A.counts.succeeded} payment${A.counts.succeeded===1?"":"s"}${
+        A.settled && A.settled.length ? " · " + A.settled.map(x => esc(money(x.net,x.currency))).join(" · ") + " after fees" : ""}`)}
     ${k("Stripe fees · "+A.days+"d", esc(feeTotal), feeRate != null ? feeRate+"% of gross" : "—")}
     ${k("Average order", A.aov != null ? esc(money(A.aov, A.byCurrency[0].currency)) : "—",
         A.buyers ? `${A.buyers} buyer${A.buyers===1?"":"s"}, ${A.repeat} repeat` : "—")}
@@ -842,17 +878,47 @@ function panelFor(A){
     </tbody></table></div></div>`, {empty: !lk && !A.events.length}); }
 
   /* ================= PINNED TOP ROW ================= */
+  const now = Date.now()/1000;
+  const clears = c => {
+    if (!c.settle || !c.settle.on) return `<span class="muted">—</span>`;
+    const n = Math.ceil((c.settle.on - now)/86400);
+    if (c.settle.status === "available" || n <= 0) return `<span class="pill s-ok">cleared</span><div class="clr">${esc(d8(c.settle.on))}</div>`;
+    return `${esc(d8(c.settle.on))}<div class="clr">${n === 1 ? "tomorrow" : "in " + n + " days"}</div>`;
+  };
+  const rowText = c => [dt(c.created), c.state, money(c.amount,c.currency), c.who, c.brand, c.note,
+    c.settle ? money(c.settle.net,c.settle.currency) : ""].join(" ").toLowerCase();
   const recentMod = mod("Recent payments", A.counts.hasMore ? "100+ in window" : A.counts.total+" in window",
-    `<div class="body flush"><div class="scroll"><table>
-    <thead><tr><th>When</th><th>State</th><th class="num">Amount</th><th>Customer</th><th></th></tr></thead><tbody>
-      ${A.recent.length ? A.recent.map(c => `<tr><td class="muted">${esc(dt(c.created))}</td>
+    `<div class="body flush">
+    <div class="tblbar">
+      <input type="search" data-filter="recent" placeholder="Filter by customer, amount, card or state" aria-label="Filter payments">
+      <div class="chips" role="group" aria-label="Show">
+        <button type="button" class="chip on" data-state="">All</button>
+        <button type="button" class="chip" data-state="succeeded">Succeeded</button>
+        <button type="button" class="chip" data-state="failed">Failed</button>
+        <button type="button" class="chip" data-state="refund">Refunded</button>
+      </div>
+      <span class="cnt" data-shown></span>
+      <button type="button" class="btn-sm" data-csv title="Download these payments as a spreadsheet">Export CSV</button>
+    </div>
+    <div class="scroll tall"><table id="recent-tbl">
+    <thead><tr><th>When</th><th>State</th><th class="num">Amount</th><th class="num">Stripe fee</th><th class="num">Net to you</th><th>Clears</th><th>Customer</th><th></th></tr></thead><tbody>
+      ${A.recent.length ? A.recent.map(c => `<tr data-row="${esc(rowText(c))}" data-state="${esc(c.state)}"><td class="muted nw">${esc(dt(c.created))}</td>
         <td><span class="pill ${c.state==="succeeded"?"s-ok":c.state==="failed"||c.state==="disputed"?"s-bad":"s-warn"}">${esc(c.state)}</span></td>
         <td class="num">${esc(money(c.amount,c.currency))}</td>
+        <td class="num muted">${c.settle ? esc(money(c.settle.fee,c.settle.currency)) : "—"}</td>
+        <td class="num">${c.settle ? `<strong>${esc(money(c.settle.net,c.settle.currency))}</strong>${
+          c.settle.rate ? `<div class="clr" title="Stripe's exchange rate on this payment">${esc(c.currency.toUpperCase())}→${esc(c.settle.currency.toUpperCase())} @ ${Number(c.settle.rate).toFixed(4)}</div>` : ""}` : "—"}</td>
+        <td class="nw">${clears(c)}</td>
         <td class="trunc">${esc(c.who)}${c.brand?`<div class="muted" style="font-size:11px">${esc(c.brand)}</div>`:""}</td>
         <td class="num">${c.refundable > 0 && c.state !== "failed"
           ? `<button type="button" class="btn-sm" data-refund="${esc(c.id)}">Refund</button>` : ""}</td></tr>`).join("")
-        : `<tr><td colspan="5" class="muted">No payments in this window.</td></tr>`}
-    </tbody></table></div></div>`);
+        : `<tr><td colspan="8" class="muted">No payments in this window.</td></tr>`}
+    </tbody></table></div>
+    <div class="tfoot">${A.settled && A.settled.length
+      ? `<span>Succeeded in ${A.days}d:</span>` + A.settled.map(x => `<span><b>${esc(money(x.net,x.currency))}</b> net to you ·
+          ${esc(money(x.fee,x.currency))} Stripe fees · ${esc(money(x.gross,x.currency))} gross · ${x.count} payment${x.count===1?"":"s"}</span>`).join("")
+      : `<span class="muted">No settled payments in this window.</span>`}</div>
+  </div>`);
 
   const accountMod = mod("Account", null, `<div class="body"><dl class="kv">
     <dt>Opened</dt><dd>${esc(d8(A.created))}${A.created ? ` <span class="muted">· ${
@@ -871,17 +937,20 @@ function panelFor(A){
 
   /* ---- render the groups ---- */
   const LABEL = {money:"Money", payments:"Payments", actions:"Actions", risk:"Risk", customers:"Customers", account:"Activity"};
+  const jump = [{id:"top-row", label:"Account & payments"}];
   const sections = Object.keys(G).map(g => {
     const live = G[g].filter(m => !m.empty), quiet = G[g].filter(m => m.empty);
     if (!live.length && !quiet.length) return "";
-    return `<section class="group"><h3 class="grp">${LABEL[g]}</h3>
+    jump.push({id:"grp-"+g, label:LABEL[g]});
+    return `<section class="group" id="grp-${g}"><h3 class="grp">${LABEL[g]}</h3>
       ${live.length ? `<div class="grid">${live.map(m => m.html).join("")}</div>` : ""}
       ${quiet.length ? `<p class="quiet"><b>Nothing to report</b> · ${quiet.map(m => esc(m.title)).join(" · ")}</p>` : ""}
     </section>`;
   }).join("");
 
+  A._jump = jump;
   return confirmStrip() + flashStrip() + triage(A) + kpis(A)
-       + `<div class="topgrid">${accountMod}${recentMod}</div>` + sections;
+       + `<div class="topgrid" id="top-row">${accountMod}${recentMod}</div>` + sections;
 }
 
 /* ---------- state ---------- */
@@ -933,7 +1002,9 @@ function render(){
     panel.innerHTML = `<section class="mod"><div class="errbox">${esc(cur.error)}</div></section>`;
     return;
   }
-  const bar = `<div class="toolbar">
+  const body = panelFor(cur.A);
+  const jump = (cur.A._jump || []).map(j => `<a href="#${j.id}">${esc(j.label)}</a>`).join("");
+  const bar = `<div class="toolbar"><div class="tb-row">
     <span class="keyfp" title="The key this tab is using">${esc(cur.reveal ? cur.key : cur.A.fp)}</span>
     <button type="button" class="mini" data-reveal="${active}" title="${cur.reveal ? "Hide the full key" : "Show the full key"}">${cur.reveal ? "Hide" : "Show"}</button>
     <button type="button" class="mini${cur.copied ? " done" : ""}" data-copy-key="${active}" title="Copy the full key to the clipboard">${cur.copied ? "Copied ✓" : "Copy key"}</button>
@@ -942,8 +1013,9 @@ function render(){
     ${cur.failed ? `<span class="fail">· refresh failed: ${esc(cur.failed)} (showing the last good reading)</span>` : ""}
     <span class="spacer"></span>
     <button type="button" data-refresh="${active}" ${cur.busy ? "disabled" : ""}>Refresh this account</button>
-  </div>`;
-  panel.innerHTML = bar + panelFor(cur.A);
+  </div>${jump ? `<div class="tb-row jump">${jump}</div>` : ""}</div>`;
+  panel.innerHTML = bar + body;
+  applyRecentFilter(cur);
 }
 
 document.addEventListener("click", ev => {
@@ -952,8 +1024,52 @@ document.addEventListener("click", ev => {
   const v = ev.target.closest("[data-reveal]");
   if (v){ const row = accounts[Number(v.dataset.reveal)]; if (row){ row.reveal = !row.reveal; render(); } return; }
   const c = ev.target.closest("[data-copy-key]");
-  if (c){ copyKey(Number(c.dataset.copyKey)); }
+  if (c){ copyKey(Number(c.dataset.copyKey)); return; }
+  const chip = ev.target.closest(".chip[data-state]");
+  if (chip){ const row = accounts[active]; if (row){ row.rs = chip.dataset.state || ""; applyRecentFilter(row); } return; }
+  if (ev.target.closest("[data-csv]")){ const row = accounts[active]; if (row && row.A) exportRecentCsv(row.A); }
 });
+
+document.addEventListener("input", ev => {
+  const f = ev.target.closest("[data-filter]");
+  if (f){ const row = accounts[active]; if (row){ row.rq = f.value; applyRecentFilter(row); } }
+});
+
+// Hides payment rows that do not match the text filter or the state chip. Pure show/hide:
+// nothing is re-rendered, so the filter box keeps focus while typing.
+function applyRecentFilter(row){
+  const tbl = document.getElementById("recent-tbl"); if (!tbl || !row) return;
+  const box = tbl.closest(".mod");
+  const q = (row.rq || "").trim().toLowerCase(), st = row.rs || "";
+  const inp = box.querySelector("[data-filter]"); if (inp && inp.value !== (row.rq || "")) inp.value = row.rq || "";
+  box.querySelectorAll(".chip[data-state]").forEach(b => b.classList.toggle("on", (b.dataset.state || "") === st));
+  let shown = 0, total = 0;
+  tbl.querySelectorAll("tbody tr[data-row]").forEach(tr => {
+    total++;
+    const okQ = !q || tr.dataset.row.includes(q);
+    const okS = !st || tr.dataset.state === st || (st === "refund" && /refund/.test(tr.dataset.state));
+    tr.hidden = !(okQ && okS); if (okQ && okS) shown++;
+  });
+  const cnt = box.querySelector("[data-shown]");
+  if (cnt) cnt.textContent = total ? (shown === total ? `${total} shown` : `${shown} of ${total} shown`) : "";
+}
+
+// Builds a CSV of the listed payments in the browser and hands it to the download manager.
+function exportRecentCsv(A){
+  const unit = (minor, cur) => ((minor || 0) / (ZERO_DEC.has((cur || "").toUpperCase()) ? 1 : 100)).toFixed(ZERO_DEC.has((cur || "").toUpperCase()) ? 0 : 2);
+  const q = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const head = ["when","state","amount","currency","stripe_fee","net_to_you","settlement_currency","exchange_rate","clears_on","customer","card","note","charge_id"];
+  const rows = A.recent.map(c => [new Date(c.created*1000).toISOString(), c.state, unit(c.amount,c.currency), (c.currency||"").toUpperCase(),
+    c.settle ? unit(c.settle.fee,c.settle.currency) : "", c.settle ? unit(c.settle.net,c.settle.currency) : "",
+    c.settle ? (c.settle.currency||"").toUpperCase() : "", c.settle && c.settle.rate ? c.settle.rate : "",
+    c.settle && c.settle.on ? new Date(c.settle.on*1000).toISOString().slice(0,10) : "", c.who, c.brand, c.note, c.id].map(q).join(","));
+  const blob = new Blob([[head.join(",")].concat(rows).join("\n")], {type:"text/csv"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `payments-${A.id}-${new Date().toISOString().slice(0,10)}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
 
 // Copies the full key to the clipboard and flips the button to "Copied" for a moment.
 // If the browser blocks the clipboard, the key is revealed so it can be selected by hand.
@@ -1174,6 +1290,23 @@ $("#reset").addEventListener("click", () => {
   $("#key").value = "";
   render(); $("#key").focus();
 });
+
+// Light / dark switch. The choice is remembered in this browser only; keys are never stored.
+(function(){
+  let saved = null; try { saved = localStorage.getItem("theme"); } catch(e){}
+  if (saved === "light" || saved === "dark") document.documentElement.dataset.theme = saved;
+  const b = document.getElementById("theme");
+  const current = () => document.documentElement.dataset.theme
+    || (window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  const paint = () => { b.textContent = current() === "dark" ? "☀ Light" : "☾ Dark"; };
+  b.addEventListener("click", () => {
+    const next = current() === "dark" ? "light" : "dark";
+    document.documentElement.dataset.theme = next;
+    try { localStorage.setItem("theme", next); } catch(e){}
+    paint();
+  });
+  paint();
+})();
 
 render();
 </script>
