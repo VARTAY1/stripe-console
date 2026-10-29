@@ -111,6 +111,32 @@ button:disabled{opacity:.5;cursor:default}
 .tfoot b{color:var(--ink)}
 .clr{font-size:11px;color:var(--ink-faint);white-space:nowrap}
 .nw{white-space:nowrap}
+.selc{width:30px;padding-right:0}
+.selc input{width:15px;height:15px;accent-color:var(--accent);cursor:pointer;margin:0;vertical-align:middle}
+.bulkbar{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);
+  background:var(--accent-soft);font-size:12.5px;color:var(--ink)}
+.bulkbar .spacer{flex:1}
+dialog.dlg{border:1px solid var(--line-2);border-radius:14px;background:var(--surface);color:var(--ink);padding:0;
+  width:min(540px,calc(100vw - 32px));box-shadow:0 24px 60px rgba(0,0,0,.35)}
+dialog.dlg::backdrop{background:rgba(6,8,12,.55);backdrop-filter:blur(2px)}
+.dlg-body{padding:20px 22px}
+.dlg-head{font-family:var(--display);font-weight:700;font-size:17px;letter-spacing:-.01em;margin-bottom:8px}
+.dlg-detail{font-size:13px;color:var(--ink-dim);line-height:1.5}
+.dlg-detail b{color:var(--ink)}
+.dlg-amount{display:flex;align-items:center;gap:8px;margin-top:14px;font-size:12px;color:var(--ink-dim)}
+.dlg-amount input{font:inherit;font-size:14px;font-family:var(--mono);padding:7px 10px;border-radius:8px;
+  border:1px solid var(--line-2);background:var(--surface-2);color:var(--ink);width:150px}
+.dlg-acts{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
+.dlg-acts button{padding:8px 16px;font-size:13px;border-radius:9px;cursor:pointer;font-weight:600;
+  border:1px solid var(--line-2);background:var(--surface-2);color:var(--ink)}
+.dlg-acts button:disabled{opacity:.6;cursor:wait}
+.dlg-acts .yes{background:var(--bad);border-color:transparent;color:#fff}
+.dlg-result.ok .dlg-head{color:var(--ok)} .dlg-result.no .dlg-head{color:var(--bad)}
+.dlg-result.ok .dlg-acts .yes{background:var(--ok)}
+.dlg-list{margin:10px 0 0;padding-left:18px;font-size:12.5px;color:var(--ink-dim);max-height:200px;overflow:auto}
+.dlg-code{display:flex;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap}
+.dlg-code code{font-family:var(--mono);font-size:12px;background:var(--surface-2);padding:4px 8px;border-radius:6px;word-break:break-all}
+.dlg-code a{color:var(--accent);word-break:break-all;font-size:12.5px}
 .toolbar button{padding:7px 13px;font-size:12.5px}
 .toolbar .fail{color:var(--bad)}
 .toolbar .keyfp{font-family:var(--mono);font-size:12px;color:var(--ink);background:var(--surface);
@@ -269,6 +295,7 @@ dl.kv dd{margin:0;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
   <div id="panel"></div>
 </div>
 
+<dialog id="dlg" class="dlg" aria-labelledby="dlg-title"><div class="dlg-body"></div></dialog>
 <script>
 "use strict";
 const $ = s => document.querySelector(s);
@@ -574,56 +601,82 @@ let pending = null;   // {what, detail, label, amount:{value,currency,max}, run(
 let flash = null;     // {ok, text, code, link}
 let working = false;
 
-function ask(cfg){ pending = cfg; flash = null; render(); }
+/* ---------- the confirmation window ----------
+   Every action opens the same <dialog> over the page: the question, an editable amount
+   where there is one, Cancel and the final button. While Stripe works the window shows
+   progress; then it shows the result with Done. Esc or a click outside cancels; Enter
+   confirms. Nothing fires on the first click, and nothing is drawn at the top of the page. */
+const dlg = () => document.getElementById("dlg");
+function showDialog(html, focusSel){
+  const d = dlg(); d.querySelector(".dlg-body").innerHTML = html;
+  if (!d.open) d.showModal();
+  const f = focusSel && d.querySelector(focusSel); if (f) f.focus();
+}
+function closeDialog(){ const d = dlg(); if (d.open) d.close(); pending = null; flash = null; }
+
+function ask(cfg){
+  pending = cfg; flash = null;
+  const a = cfg.amount;
+  showDialog(`<div class="dlg-head">${cfg.what}</div>
+    <div class="dlg-detail">${cfg.detail || ""}</div>
+    ${a ? `<label class="dlg-amount">Amount
+      <input id="confirm-amount" type="number" step="0.01" min="0.01"
+             max="${(a.max/100).toFixed(2)}" value="${(a.value/100).toFixed(2)}">
+      <span>${esc((a.currency || "").toUpperCase())}</span></label>` : ""}
+    <div class="dlg-acts">
+      <button type="button" class="no" data-ask-no>Cancel</button>
+      <button type="button" class="yes" data-ask-yes>${esc(cfg.label)}</button>
+    </div>`, a ? "#confirm-amount" : "[data-ask-no]");
+}
+
+function confirmNow(){
+  if (!pending || working) return;
+  const f = document.getElementById("confirm-amount");
+  const cur = pending.amount ? pending.amount.currency : null;
+  runPending(f ? minor(f.value, cur) : null);
+}
 
 async function runPending(amountMinor){
   const job = pending;
   pending = null;
   if (!job || working) return;
   working = true;
-  flash = {ok:true, text:"Sending to Stripe…"};
-  render();
+  const progress = txt => showDialog(`<div class="dlg-head">Working…</div>
+    <div class="dlg-detail">${esc(txt)}</div>
+    <div class="dlg-acts"><button type="button" class="no" disabled>Please wait</button></div>`);
+  progress("Sending to Stripe…");
   try {
-    const out = await job.run(amountMinor);
+    const out = await job.run(amountMinor, progress);
     flash = Object.assign({ok:true}, typeof out === "string" ? {text:out} : out);
   } catch(e){
     flash = {ok:false, text: e.message || String(e)};
   }
   working = false;
-  render();
+  showDialog(resultHtml(flash), "[data-flash-close]");
   if (job.reread !== false) refreshAccount(active);
 }
 
-function confirmStrip(){
-  if (!pending) return "";
-  const a = pending.amount;
-  return `<div class="confirm">
-    <div style="min-width:0">
-      <div class="what">${pending.what}</div>
-      <div class="detail">${pending.detail || ""}</div>
-    </div>
-    ${a ? `<label style="font-size:11px">Amount
-      <input id="confirm-amount" type="number" step="0.01" min="0.01"
-             max="${(a.max/100).toFixed(2)}" value="${(a.value/100).toFixed(2)}"></label>` : ""}
-    <span class="spacer"></span>
-    <span class="acts">
-      <button type="button" class="no" data-ask-no>Cancel</button>
-      <button type="button" class="yes" data-ask-yes>${esc(pending.label)}</button>
-    </span>
+function resultHtml(f){
+  return `<div class="dlg-result ${f.ok ? "ok" : "no"}">
+    <div class="dlg-head">${f.ok ? "Done" : "Stripe refused"}</div>
+    <div class="dlg-detail">${esc(f.text)}</div>
+    ${f.lines && f.lines.length ? `<ul class="dlg-list">${f.lines.map(l => `<li>${esc(l)}</li>`).join("")}</ul>` : ""}
+    ${f.code && f.code !== f.link ? `<div class="dlg-code"><code>${esc(f.code)}</code>
+      <button type="button" class="btn-sm" data-copy="${esc(f.code)}">Copy</button></div>` : ""}
+    ${f.link ? `<div class="dlg-code"><a href="${esc(f.link)}" target="_blank" rel="noreferrer">${esc(f.link)}</a>
+      <button type="button" class="btn-sm" data-copy="${esc(f.link)}">Copy</button></div>` : ""}
+    <div class="dlg-acts"><button type="button" class="yes" data-flash-close>Done</button></div>
   </div>`;
 }
 
-function flashStrip(){
-  if (!flash) return "";
-  return `<div class="flash ${flash.ok ? "ok" : "no"}">
-    <span>${esc(flash.text)}</span>
-    ${flash.code ? `<code>${esc(flash.code)}</code>
-      <button type="button" class="btn-sm" data-copy="${esc(flash.code)}">Copy</button>` : ""}
-    ${flash.link ? `<a href="${esc(flash.link)}" target="_blank" rel="noreferrer">Open</a>` : ""}
-    <span class="spacer"></span>
-    <button type="button" class="btn-sm" data-flash-close>Dismiss</button>
-  </div>`;
-}
+(function(){
+  const d = dlg();
+  d.addEventListener("cancel", ev => { ev.preventDefault(); if (!working) closeDialog(); });
+  d.addEventListener("click", ev => { if (ev.target === d && !working) closeDialog(); });
+  d.addEventListener("keydown", ev => {
+    if (ev.key === "Enter" && pending && !working && !ev.target.closest("button")){ ev.preventDefault(); confirmNow(); }
+  });
+})();
 
 /* ---------- rendering ---------- */
 const mod = (title, meta, body, cls) =>
@@ -900,9 +953,12 @@ function panelFor(A){
       <span class="cnt" data-shown></span>
       <button type="button" class="btn-sm" data-csv title="Download these payments as a spreadsheet">Export CSV</button>
     </div>
+    <div class="bulkbar" data-bulkbar hidden></div>
     <div class="scroll tall"><table id="recent-tbl">
-    <thead><tr><th>When</th><th>State</th><th class="num">Amount</th><th class="num">Stripe fee</th><th class="num">Net to you</th><th>Clears</th><th>Customer</th><th></th></tr></thead><tbody>
-      ${A.recent.length ? A.recent.map(c => `<tr data-row="${esc(rowText(c))}" data-state="${esc(c.state)}"><td class="muted nw">${esc(dt(c.created))}</td>
+    <thead><tr><th class="selc"><input type="checkbox" data-sel-all title="Select every refundable payment shown" aria-label="Select all refundable payments shown"></th><th>When</th><th>State</th><th class="num">Amount</th><th class="num">Stripe fee</th><th class="num">Net to you</th><th>Clears</th><th>Customer</th><th></th></tr></thead><tbody>
+      ${A.recent.length ? A.recent.map(c => `<tr data-row="${esc(rowText(c))}" data-state="${esc(c.state)}"><td class="selc">${c.refundable > 0 && c.state !== "failed"
+          ? `<input type="checkbox" data-sel="${esc(c.id)}" ${A._sel && A._sel.has(c.id) ? "checked" : ""} aria-label="Select this payment">` : ""}</td>
+        <td class="muted nw">${esc(dt(c.created))}</td>
         <td><span class="pill ${c.state==="succeeded"?"s-ok":c.state==="failed"||c.state==="disputed"?"s-bad":"s-warn"}">${esc(c.state)}</span></td>
         <td class="num">${esc(money(c.amount,c.currency))}</td>
         <td class="num muted">${c.settle ? esc(money(c.settle.fee,c.settle.currency)) : "—"}</td>
@@ -912,7 +968,7 @@ function panelFor(A){
         <td class="trunc">${esc(c.who)}${c.brand?`<div class="muted" style="font-size:11px">${esc(c.brand)}</div>`:""}</td>
         <td class="num">${c.refundable > 0 && c.state !== "failed"
           ? `<button type="button" class="btn-sm" data-refund="${esc(c.id)}">Refund</button>` : ""}</td></tr>`).join("")
-        : `<tr><td colspan="8" class="muted">No payments in this window.</td></tr>`}
+        : `<tr><td colspan="9" class="muted">No payments in this window.</td></tr>`}
     </tbody></table></div>
     <div class="tfoot">${A.settled && A.settled.length
       ? `<span>Succeeded in ${A.days}d:</span>` + A.settled.map(x => `<span><b>${esc(money(x.net,x.currency))}</b> net to you ·
@@ -949,7 +1005,7 @@ function panelFor(A){
   }).join("");
 
   A._jump = jump;
-  return confirmStrip() + flashStrip() + triage(A) + kpis(A)
+  return triage(A) + kpis(A)
        + `<div class="topgrid" id="top-row">${accountMod}${recentMod}</div>` + sections;
 }
 
@@ -968,7 +1024,9 @@ async function refreshAccount(i){
   if (!row || !row.key || row.busy) return;
   row.busy = true; row.failed = null; render();
   try {
+    const prev = row.A;
     row.A = await load(row.key, row.A ? row.A.days : 30);
+    if (prev && prev._sel) row.A._sel = prev._sel;
     row.at = Date.now();
   } catch(e){
     row.failed = e.message || String(e);   // keep the previous reading on screen
@@ -1052,7 +1110,42 @@ function applyRecentFilter(row){
   });
   const cnt = box.querySelector("[data-shown]");
   if (cnt) cnt.textContent = total ? (shown === total ? `${total} shown` : `${shown} of ${total} shown`) : "";
+  if (row.A) updateBulkBar(row.A);
 }
+
+// Selection lives on the account (A._sel, a Set of charge ids) so it survives re-renders.
+// Only the bar and the checkboxes are touched here; the table is not redrawn.
+function updateBulkBar(A){
+  const bar = document.querySelector("[data-bulkbar]"); if (!bar) return;
+  const sel = A._sel || (A._sel = new Set());
+  for (const id of [...sel]){ const c = A.recent.find(x => x.id === id); if (!c || !(c.refundable > 0 && c.state !== "failed")) sel.delete(id); }
+  document.querySelectorAll("[data-sel]").forEach(cb => { cb.checked = sel.has(cb.dataset.sel); });
+  const all = document.querySelector("[data-sel-all]");
+  if (all){
+    const vis = [...document.querySelectorAll("tr[data-row]:not([hidden]) [data-sel]")];
+    const on = vis.filter(cb => cb.checked).length;
+    all.checked = vis.length > 0 && on === vis.length; all.indeterminate = on > 0 && on < vis.length;
+  }
+  if (!sel.size){ bar.hidden = true; bar.innerHTML = ""; return; }
+  const tot = {};
+  for (const id of sel){ const c = A.recent.find(x => x.id === id); tot[c.currency] = (tot[c.currency]||0) + c.refundable; }
+  const totTxt = Object.entries(tot).map(([cur,v]) => money(v,cur)).join(" · ");
+  bar.hidden = false;
+  bar.innerHTML = `<span><b>${sel.size}</b> selected · ${esc(totTxt)}</span><span class="spacer"></span>
+    <button type="button" class="btn-sm" data-sel-clear>Clear</button>
+    <button type="button" class="btn-sm danger" data-bulk-refund>Refund selected</button>`;
+}
+
+document.addEventListener("change", ev => {
+  const row = accounts[active]; const A = row && row.A; if (!A) return;
+  const cb = ev.target.closest("[data-sel]");
+  if (cb){ (A._sel || (A._sel = new Set()))[cb.checked ? "add" : "delete"](cb.dataset.sel); updateBulkBar(A); return; }
+  if (ev.target.closest("[data-sel-all]")){
+    const on = ev.target.checked, sel = A._sel || (A._sel = new Set());
+    document.querySelectorAll("tr[data-row]:not([hidden]) [data-sel]").forEach(c => sel[on ? "add" : "delete"](c.dataset.sel));
+    updateBulkBar(A);
+  }
+});
 
 // Builds a CSV of the listed payments in the browser and hands it to the download manager.
 function exportRecentCsv(A){
@@ -1107,14 +1200,9 @@ document.addEventListener("click", async ev => {
   const A = row && row.A;
   const key = row && row.key;
 
-  if (ev.target.closest("[data-flash-close]")){ flash = null; render(); return; }
-  if (ev.target.closest("[data-ask-no]")){ pending = null; render(); return; }
-  if (ev.target.closest("[data-ask-yes]")){
-    const f = document.getElementById("confirm-amount");
-    const cur = pending && pending.amount ? pending.amount.currency : null;
-    runPending(f ? minor(f.value, cur) : null);
-    return;
-  }
+  if (ev.target.closest("[data-flash-close]")){ closeDialog(); return; }
+  if (ev.target.closest("[data-ask-no]")){ closeDialog(); return; }
+  if (ev.target.closest("[data-ask-yes]")){ confirmNow(); return; }
   const copy = ev.target.closest("[data-copy]");
   if (copy){
     try { await navigator.clipboard.writeText(copy.dataset.copy); copy.textContent = "Copied"; }
@@ -1122,6 +1210,40 @@ document.addEventListener("click", async ev => {
     return;
   }
   if (!A || !key) return;
+
+  /* selection + bulk refund */
+  if (ev.target.closest("[data-sel-clear]")){ if (A._sel) A._sel.clear(); updateBulkBar(A); return; }
+  if (ev.target.closest("[data-bulk-refund]")){
+    const items = [...(A._sel || [])].map(id => A.recent.find(x => x.id === id))
+      .filter(c => c && c.refundable > 0 && c.state !== "failed");
+    if (!items.length) return;
+    const tot = {}; items.forEach(c => { tot[c.currency] = (tot[c.currency]||0) + c.refundable; });
+    const totTxt = Object.entries(tot).map(([cur,v]) => money(v,cur)).join(" · ");
+    const n = items.length;
+    ask({
+      what: `Refund ${n} payment${n>1?"s":""} in full?`,
+      detail: `<b>${esc(totTxt)}</b> goes back to these customers. Refunds cannot be undone; they are sent one after another.
+        <ul class="dlg-list">${items.map(c => `<li>${esc(money(c.refundable,c.currency))} · ${esc(c.who)} · ${esc(dt(c.created))}</li>`).join("")}</ul>`,
+      label: `Refund ${n} payment${n>1?"s":""}`,
+      run: async (_, progress) => {
+        const done = [], failed = [];
+        for (let i = 0; i < items.length; i++){
+          const c = items[i];
+          progress(`Refunding ${i+1} of ${n}: ${money(c.refundable,c.currency)} to ${c.who}…`);
+          try { await sp(key, "refunds", {charge: c.id, amount: c.refundable}, idemKey()); done.push(c); }
+          catch(e){ failed.push(`${money(c.refundable,c.currency)} to ${c.who} — ${e.message || e}`); }
+        }
+        if (A._sel) A._sel.clear();
+        updateBulkBar(A);
+        const dTot = {}; done.forEach(c => { dTot[c.currency] = (dTot[c.currency]||0) + c.refundable; });
+        const dTxt = Object.entries(dTot).map(([cur,v]) => money(v,cur)).join(" · ");
+        const text = `Refunded ${done.length} of ${n} payment${n>1?"s":""}${done.length ? " · " + dTxt : ""}.`;
+        if (!done.length) throw new Error(text + " " + failed.join(" · "));
+        return {text, lines: failed.map(f => "Not refunded: " + f)};
+      }
+    });
+    return;
+  }
 
   /* refund */
   const rf = ev.target.closest("[data-refund]");
