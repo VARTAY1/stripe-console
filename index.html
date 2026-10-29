@@ -111,18 +111,6 @@ button:disabled{opacity:.5;cursor:default}
 .tfoot b{color:var(--ink)}
 .clr{font-size:11px;color:var(--ink-faint);white-space:nowrap}
 .nw{white-space:nowrap}
-.verif{margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}
-.verif .vh{font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-faint);font-weight:700;margin-bottom:6px}
-.verif .vwhy{font-size:12.5px;color:var(--bad);margin:0 0 6px;line-height:1.45}
-.verif .vwhy b{color:inherit}
-.verif .vlab{font-size:12px;color:var(--ink-dim);margin:8px 0 3px;font-weight:600}
-.verif .vlist{margin:0;padding-left:18px;font-size:12.5px;color:var(--ink);line-height:1.45}
-.verif .vlist li{margin:2px 0}
-.verif .vlist li.bad{color:var(--bad)}
-.vraw{margin-top:10px;font-size:12.5px}
-.vraw summary{cursor:pointer;color:var(--accent);font-size:12px}
-.vraw dl.kv{margin-top:8px;font-size:12px}
-.vraw .mono{font-size:11.5px;word-break:break-all;line-height:1.5}
 .selc{width:30px;padding-right:0}
 .selc input{width:15px;height:15px;accent-color:var(--accent);cursor:pointer;margin:0;vertical-align:middle}
 .bulkbar{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);
@@ -396,10 +384,6 @@ async function load(key, days){
     else ERR[n] = {message: res[i].reason.message, permission: !!res[i].reason.permission};
   });
   if (!D.account) throw new Error(ERR.account ? ERR.account.message : "Could not read the account");
-  // Capabilities carry their own requirements and disabled reason; Stripe sometimes records a
-  // restriction there and not on the account itself. Best effort: ignored if the key cannot read it.
-  try { D.caps = await sq(key, `accounts/${D.account.id}/capabilities`); }
-  catch(e){ ERR.caps = {message: e.message, permission: !!e.permission}; }
   return derive(key, days, D, ERR);
 }
 
@@ -756,7 +740,7 @@ function triage(A){
   const add = (k, what, detail) => out.push(`<div class="alert a-${k}"><span class="what">${what}</span>
     <span class="detail">${detail}</span></div>`);
   // Only account restrictions are surfaced here, by the owner's choice (2026-10-27).
-  if (A.disabledReason) add("bad","Account restricted", esc(DISABLED_WHY[A.disabledReason] || lbl(A.disabledReason)) + (A.restrictedAt ? ` · since ${esc(dt(A.restrictedAt))}` : "") + ". See Stripe verification in the Account card.");
+  if (A.disabledReason) add("bad","Account restricted", esc(DISABLED_WHY[A.disabledReason] || lbl(A.disabledReason)) + (A.restrictedAt ? ` · since ${esc(dt(A.restrictedAt))}` : ""));
   if (A.chargesEnabled === false) add("bad","Charges disabled","This account cannot take payments.");
   if (A.payoutsEnabled === false) add("warn","Payouts disabled","Money builds up but will not reach the bank.");
   return out.length ? `<div class="triage">${out.join("")}</div>` : "";
@@ -787,29 +771,6 @@ const OPEN_DISPUTE = new Set(["needs_response", "warning_needs_response"]);
 const canRefund = c => c.refundable > 0 && c.state !== "failed" && c.state !== "disputed";
 const openDisputeFor = (A, c) => (A.disputes || []).find(d => d.charge === c.id && OPEN_DISPUTE.has(d.status));
 
-// Stripe names what it needs by field; these turn the field names into things a person can act on.
-const REQ_LABELS = [
-  [/verification\.additional_document$/, "Second document — proof of address (utility bill or bank statement)"],
-  [/verification\.document$/, "Government photo ID — passport, driving licence or national ID card"],
-  [/selfie/, "Selfie / live photo check"],
-  [/\.id_number$|ssn_last_4$/, "Personal ID number (SSN, national ID or tax number)"],
-  [/\.dob\./, "Date of birth"],
-  [/\.address\./, "Address"],
-  [/\.phone$/, "Phone number"], [/\.email$/, "Email address"],
-  [/first_name|last_name/, "Legal name"],
-  [/^external_account$/, "Bank account for payouts"],
-  [/business_profile\.url/, "Business website"], [/business_profile\.mcc/, "Business category"],
-  [/business_profile\.product_description/, "Description of what the business sells"],
-  [/business_profile\.support_phone/, "Support phone number"],
-  [/tos_acceptance/, "Accept Stripe's terms of service"],
-  [/company\.tax_id/, "Company tax ID"], [/company\.verification\.document/, "Company registration document"],
-  [/company\.name/, "Company name"],
-  [/owners_provided|directors_provided|executives_provided/, "Confirm the company's owners and directors"],
-  [/relationship\./, "Business representative details"]
-];
-const reqLabel = f => { for (const [re, l] of REQ_LABELS) if (re.test(f)) return l;
-  return f.replace(/^(individual|company|representative|person_\w+)\./, "").replace(/[._]/g, " "); };
-const reqList = fields => [...new Set((fields || []).map(reqLabel))];
 const DISABLED_WHY = {
   "requirements.past_due": "Required information is overdue",
   "requirements.pending_verification": "Stripe is still verifying what was submitted",
@@ -822,51 +783,6 @@ const DISABLED_WHY = {
   "platform_paused": "Paused by the platform",
   "other": "Restricted by Stripe for another reason"
 };
-function verification(A){
-  const pastF = A.pastDue || [], dueF = [...new Set([...pastF, ...(A.currentlyDue || [])])];
-  const due = reqList(dueF), past = reqList(pastF), pend = reqList(A.pendingVerification);
-  const later = reqList((A.eventuallyDue || []).filter(f => !dueF.includes(f)));
-  const errs = A.reqErrors || [];
-  const nothing = !due.length && !pend.length && !errs.length && !A.disabledReason;
-  return `<div class="verif"><div class="vh">Stripe verification</div>
-    ${A.disabledReason ? `<p class="vwhy"><b>Why restricted:</b> ${esc(DISABLED_WHY[A.disabledReason] || lbl(A.disabledReason))}${
-      A.restrictedAt ? ` <span class="muted">· since ${esc(dt(A.restrictedAt))}</span>` : ""}</p>` : ""}
-    ${nothing ? (A.chargesEnabled === false || A.payoutsEnabled === false
-      ? `<p class="vwhy">Stripe has not listed any document or field for this restriction through the API. That usually means a manual
-          review: Stripe says what it wants in the Dashboard banner and by email to ${esc(A.email || "the account email")}, not through the API.</p>`
-      : `<p class="note">Nothing outstanding. Stripe is not asking for any documents or information.</p>`) : ""}
-    ${(A.capDisabled || []).length ? `<p class="vlab">Capabilities Stripe switched off</p><ul class="vlist">${A.capDisabled.map(c =>
-      `<li><b>${esc(lbl(c.id))}</b> — ${esc(DISABLED_WHY[c.reason] || lbl(c.reason))}</li>`).join("")}</ul>` : ""}
-    ${due.length ? `<p class="vlab">Stripe needs now${A.deadline ? ` <span class="muted">· by ${esc(d8(A.deadline))}</span>` : ""}</p>
-      <ul class="vlist">${due.map(x => `<li${past.includes(x) ? ' class="bad"' : ""}>${esc(x)}${past.includes(x) ? " <b>· overdue</b>" : ""}</li>`).join("")}</ul>` : ""}
-    ${pend.length ? `<p class="vlab">Submitted, being checked by Stripe</p><ul class="vlist">${pend.map(x => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}
-    ${errs.length ? `<p class="vlab">Problems Stripe reported</p><ul class="vlist">${errs.map(e =>
-      `<li><b>${esc(reqLabel(e.requirement || ""))}</b> — ${esc(e.reason || lbl(e.code))}</li>`).join("")}</ul>` : ""}
-    ${later.length ? `<p class="vlab muted">Needed later: ${esc(later.join(" · "))}</p>` : ""}
-    ${(due.length || pend.length || errs.length) ? `<p class="note" style="margin-top:8px">Upload or fix these in the Stripe Dashboard (Settings → Account details, or the banner at the top of the Dashboard).</p>` : ""}
-    ${recorded(A)}
-  </div>`;
-}
-
-// Everything Stripe recorded about the restriction, folded away: capability statuses, the exact
-// attributes that changed when charges or payouts went off, and the raw requirement objects.
-const fmtVal = v => v === undefined ? "—" : v === null ? "null" : typeof v === "object" ? JSON.stringify(v) : String(v);
-function recorded(A){
-  const caps = Object.entries(A.capabilities || {});
-  const detail = A.capsDetail || [];
-  if (!caps.length && !detail.length && !A.switchAt && !A.requirementsRaw) return "";
-  return `<details class="vraw"><summary>What Stripe recorded</summary><dl class="kv">
-    ${caps.length ? `<dt>Capabilities</dt><dd>${caps.map(([k,v]) => `${esc(lbl(k))}: <b>${esc(v)}</b>`).join(" · ")}</dd>` : ""}
-    ${detail.length ? `<dt>Capability detail</dt><dd>${detail.map(c => `<div>${esc(lbl(c.id))}: <b>${esc(c.status)}</b>${
-      c.req && c.req.disabled_reason ? ` · ${esc(lbl(c.req.disabled_reason))}` : ""}${
-      c.req && (c.req.currently_due||[]).length ? ` · needs ${esc((c.req.currently_due||[]).map(reqLabel).join(", "))}` : ""}</div>`).join("")}</dd>` : ""}
-    ${A.switchAt ? `<dt>Switched off</dt><dd>${esc(dt(A.switchAt))}</dd>` : ""}
-    ${(A.switchChanges || []).length ? `<dt>Changed then</dt><dd>${A.switchChanges.map(c =>
-      `<div class="mono">${esc(c.path)}: ${esc(fmtVal(c.old))} → ${esc(fmtVal(c.now))}</div>`).join("")}</dd>` : ""}
-    <dt>Requirements</dt><dd class="mono">${esc(A.requirementsRaw ? JSON.stringify(A.requirementsRaw) : "none provided by Stripe for this account")}</dd>
-    ${A.futureRequirementsRaw ? `<dt>Future</dt><dd class="mono">${esc(JSON.stringify(A.futureRequirementsRaw))}</dd>` : ""}
-  </dl></details>`;
-}
 
 // "off since …" for the Account card. Stripe keeps 30 days of events, so an older switch-off has no exact time.
 const offSince = (A, ts) => ts ? `<div class="clr">off since ${esc(dt(ts))}</div>`
@@ -1148,7 +1064,7 @@ function panelFor(A){
     <dt>Charges</dt><dd><span class="pill ${A.chargesEnabled?"s-ok":"s-bad"}">${A.chargesEnabled?"enabled":"off"}</span>${A.chargesEnabled ? "" : offSince(A, A.chargesDisabledAt)}</dd>
     <dt>Payouts</dt><dd><span class="pill ${A.payoutsEnabled?"s-ok":"s-bad"}">${A.payoutsEnabled?"enabled":"off"}</span>
       <span class="muted">${esc(lbl(A.schedule))}${A.delayDays!=null?` +${A.delayDays}d`:""}</span>${A.payoutsEnabled ? "" : offSince(A, A.payoutsDisabledAt)}</dd>
-  </dl>${verification(A)}</div>`);
+  </dl></div>`);
 
   /* ---- render the groups ---- */
   const LABEL = {money:"Money", payments:"Payments", actions:"Actions", risk:"Risk", customers:"Customers", account:"Activity"};
