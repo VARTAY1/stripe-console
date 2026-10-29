@@ -111,6 +111,14 @@ button:disabled{opacity:.5;cursor:default}
 .tfoot b{color:var(--ink)}
 .clr{font-size:11px;color:var(--ink-faint);white-space:nowrap}
 .nw{white-space:nowrap}
+.verif{margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}
+.verif .vh{font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-faint);font-weight:700;margin-bottom:6px}
+.verif .vwhy{font-size:12.5px;color:var(--bad);margin:0 0 6px;line-height:1.45}
+.verif .vwhy b{color:inherit}
+.verif .vlab{font-size:12px;color:var(--ink-dim);margin:8px 0 3px;font-weight:600}
+.verif .vlist{margin:0;padding-left:18px;font-size:12.5px;color:var(--ink);line-height:1.45}
+.verif .vlist li{margin:2px 0}
+.verif .vlist li.bad{color:var(--bad)}
 .selc{width:30px;padding-right:0}
 .selc input{width:15px;height:15px;accent-color:var(--accent);cursor:pointer;margin:0;vertical-align:middle}
 .bulkbar{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);
@@ -369,7 +377,8 @@ const CALLS = since => ({
   sessions:  ["checkout/sessions", {limit:100, status:"open"}],
   subs:      ["subscriptions", {limit:100, status:"active"}],
   invoices:  ["invoices", {limit:100}],
-  events:    ["events", {limit:50}]
+  events:    ["events", {limit:50}],
+  acctEvents:["events", {limit:100, type:"account.updated"}]
 });
 
 async function load(key, days){
@@ -513,6 +522,21 @@ function derive(key, days, D, ERR){
   const ext = (a.external_accounts && a.external_accounts.data) || [];
   const bank = ext.find(e => e.object === "bank_account") || ext[0] || null;
 
+  // When did payouts / charges go off, and when was the restriction applied? Read from
+  // account.updated events (newest first; Stripe keeps 30 days of events).
+  const acctEv = list("acctEvents");
+  const flipAt = field => {
+    const e = acctEv.find(ev => ev.data && ev.data.previous_attributes && ev.data.previous_attributes[field] === true
+      && ev.data.object && ev.data.object[field] === false);
+    return e ? e.created : null;
+  };
+  const payoutsDisabledAt = flipAt("payouts_enabled"), chargesDisabledAt = flipAt("charges_enabled");
+  const restrictedEv = acctEv.find(ev => ev.data && ev.data.previous_attributes && ev.data.previous_attributes.requirements
+    && ("disabled_reason" in ev.data.previous_attributes.requirements) && ev.data.object && ev.data.object.requirements
+    && ev.data.object.requirements.disabled_reason);
+  const restrictedAt = restrictedEv ? restrictedEv.created : null;
+  const acctEventsOldest = acctEv.length ? acctEv[acctEv.length - 1].created : null;
+
   // settlement totals of succeeded charges in the window, in the currency Stripe settled them in
   const btOf = c => (c.balance_transaction && typeof c.balance_transaction === "object") ? c.balance_transaction : null;
   const settleMap = {};
@@ -545,6 +569,10 @@ function derive(key, days, D, ERR){
     pastDue: (a.requirements && a.requirements.past_due) || [],
     deadline: a.requirements && a.requirements.current_deadline,
     disabledReason: a.requirements && a.requirements.disabled_reason,
+    pendingVerification: (a.requirements && a.requirements.pending_verification) || [],
+    eventuallyDue: (a.requirements && a.requirements.eventually_due) || [],
+    reqErrors: ((a.requirements && a.requirements.errors) || []).map(e => ({code:e.code, reason:e.reason, requirement:e.requirement})),
+    payoutsDisabledAt, chargesDisabledAt, restrictedAt, acctEventsOldest,
     bank,
     available: (D.balance && D.balance.available) || [],
     pending: (D.balance && D.balance.pending) || [],
@@ -701,7 +729,7 @@ function triage(A){
   const add = (k, what, detail) => out.push(`<div class="alert a-${k}"><span class="what">${what}</span>
     <span class="detail">${detail}</span></div>`);
   // Only account restrictions are surfaced here, by the owner's choice (2026-10-27).
-  if (A.disabledReason) add("bad","Account restricted", esc(lbl(A.disabledReason)));
+  if (A.disabledReason) add("bad","Account restricted", esc(DISABLED_WHY[A.disabledReason] || lbl(A.disabledReason)) + (A.restrictedAt ? ` · since ${esc(dt(A.restrictedAt))}` : "") + ". See Stripe verification in the Account card.");
   if (A.chargesEnabled === false) add("bad","Charges disabled","This account cannot take payments.");
   if (A.payoutsEnabled === false) add("warn","Payouts disabled","Money builds up but will not reach the bank.");
   return out.length ? `<div class="triage">${out.join("")}</div>` : "";
@@ -731,6 +759,66 @@ function kpis(A){
 const OPEN_DISPUTE = new Set(["needs_response", "warning_needs_response"]);
 const canRefund = c => c.refundable > 0 && c.state !== "failed" && c.state !== "disputed";
 const openDisputeFor = (A, c) => (A.disputes || []).find(d => d.charge === c.id && OPEN_DISPUTE.has(d.status));
+
+// Stripe names what it needs by field; these turn the field names into things a person can act on.
+const REQ_LABELS = [
+  [/verification\.additional_document$/, "Second document — proof of address (utility bill or bank statement)"],
+  [/verification\.document$/, "Government photo ID — passport, driving licence or national ID card"],
+  [/selfie/, "Selfie / live photo check"],
+  [/\.id_number$|ssn_last_4$/, "Personal ID number (SSN, national ID or tax number)"],
+  [/\.dob\./, "Date of birth"],
+  [/\.address\./, "Address"],
+  [/\.phone$/, "Phone number"], [/\.email$/, "Email address"],
+  [/first_name|last_name/, "Legal name"],
+  [/^external_account$/, "Bank account for payouts"],
+  [/business_profile\.url/, "Business website"], [/business_profile\.mcc/, "Business category"],
+  [/business_profile\.product_description/, "Description of what the business sells"],
+  [/business_profile\.support_phone/, "Support phone number"],
+  [/tos_acceptance/, "Accept Stripe's terms of service"],
+  [/company\.tax_id/, "Company tax ID"], [/company\.verification\.document/, "Company registration document"],
+  [/company\.name/, "Company name"],
+  [/owners_provided|directors_provided|executives_provided/, "Confirm the company's owners and directors"],
+  [/relationship\./, "Business representative details"]
+];
+const reqLabel = f => { for (const [re, l] of REQ_LABELS) if (re.test(f)) return l;
+  return f.replace(/^(individual|company|representative|person_\w+)\./, "").replace(/[._]/g, " "); };
+const reqList = fields => [...new Set((fields || []).map(reqLabel))];
+const DISABLED_WHY = {
+  "requirements.past_due": "Required information is overdue",
+  "requirements.pending_verification": "Stripe is still verifying what was submitted",
+  "under_review": "The account is under review by Stripe",
+  "rejected.fraud": "Stripe rejected the account for suspected fraud",
+  "rejected.terms_of_service": "Stripe rejected the account for breaching its terms",
+  "rejected.listed": "Stripe rejected the account: listed by a card network or regulator",
+  "rejected.other": "Stripe rejected the account",
+  "listed": "The account is on a prohibited list",
+  "platform_paused": "Paused by the platform",
+  "other": "Restricted by Stripe for another reason"
+};
+function verification(A){
+  const pastF = A.pastDue || [], dueF = [...new Set([...pastF, ...(A.currentlyDue || [])])];
+  const due = reqList(dueF), past = reqList(pastF), pend = reqList(A.pendingVerification);
+  const later = reqList((A.eventuallyDue || []).filter(f => !dueF.includes(f)));
+  const errs = A.reqErrors || [];
+  const nothing = !due.length && !pend.length && !errs.length && !A.disabledReason;
+  return `<div class="verif"><div class="vh">Stripe verification</div>
+    ${A.disabledReason ? `<p class="vwhy"><b>Why restricted:</b> ${esc(DISABLED_WHY[A.disabledReason] || lbl(A.disabledReason))}${
+      A.restrictedAt ? ` <span class="muted">· since ${esc(dt(A.restrictedAt))}</span>` : ""}</p>` : ""}
+    ${nothing ? `<p class="note">Nothing outstanding. Stripe is not asking for any documents or information.</p>` : ""}
+    ${due.length ? `<p class="vlab">Stripe needs now${A.deadline ? ` <span class="muted">· by ${esc(d8(A.deadline))}</span>` : ""}</p>
+      <ul class="vlist">${due.map(x => `<li${past.includes(x) ? ' class="bad"' : ""}>${esc(x)}${past.includes(x) ? " <b>· overdue</b>" : ""}</li>`).join("")}</ul>` : ""}
+    ${pend.length ? `<p class="vlab">Submitted, being checked by Stripe</p><ul class="vlist">${pend.map(x => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}
+    ${errs.length ? `<p class="vlab">Problems Stripe reported</p><ul class="vlist">${errs.map(e =>
+      `<li><b>${esc(reqLabel(e.requirement || ""))}</b> — ${esc(e.reason || lbl(e.code))}</li>`).join("")}</ul>` : ""}
+    ${later.length ? `<p class="vlab muted">Needed later: ${esc(later.join(" · "))}</p>` : ""}
+    ${!nothing ? `<p class="note" style="margin-top:8px">Upload or fix these in the Stripe Dashboard (Settings → Account details, or the banner at the top of the Dashboard).</p>` : ""}
+  </div>`;
+}
+
+// "off since …" for the Account card. Stripe keeps 30 days of events, so an older switch-off has no exact time.
+const offSince = (A, ts) => ts ? `<div class="clr">off since ${esc(dt(ts))}</div>`
+  : A.err && A.err.acctEvents ? `<div class="clr">time unknown — key cannot read events</div>`
+  : `<div class="clr">off since before ${A.acctEventsOldest ? esc(d8(A.acctEventsOldest)) : "the last 30 days"} (older than Stripe's event history)</div>`;
 
 function panelFor(A){
   // Account and Recent payments are pinned to the top row. Everything else sits under
@@ -1004,10 +1092,10 @@ function panelFor(A){
     <dt>Business type</dt><dd>${esc(lbl(A.businessType||"—"))}</dd>
     <dt>Statement name</dt><dd>${esc(A.statement||"—")}</dd>
     <dt>Payout account</dt><dd>${A.bank ? esc((A.bank.bank_name||A.bank.object)+" ····"+(A.bank.last4||"")) : "—"}</dd>
-    <dt>Charges</dt><dd><span class="pill ${A.chargesEnabled?"s-ok":"s-bad"}">${A.chargesEnabled?"enabled":"off"}</span></dd>
+    <dt>Charges</dt><dd><span class="pill ${A.chargesEnabled?"s-ok":"s-bad"}">${A.chargesEnabled?"enabled":"off"}</span>${A.chargesEnabled ? "" : offSince(A, A.chargesDisabledAt)}</dd>
     <dt>Payouts</dt><dd><span class="pill ${A.payoutsEnabled?"s-ok":"s-bad"}">${A.payoutsEnabled?"enabled":"off"}</span>
-      <span class="muted">${esc(lbl(A.schedule))}${A.delayDays!=null?` +${A.delayDays}d`:""}</span></dd>
-  </dl></div>`);
+      <span class="muted">${esc(lbl(A.schedule))}${A.delayDays!=null?` +${A.delayDays}d`:""}</span>${A.payoutsEnabled ? "" : offSince(A, A.payoutsDisabledAt)}</dd>
+  </dl>${verification(A)}</div>`);
 
   /* ---- render the groups ---- */
   const LABEL = {money:"Money", payments:"Payments", actions:"Actions", risk:"Risk", customers:"Customers", account:"Activity"};
