@@ -119,6 +119,10 @@ button:disabled{opacity:.5;cursor:default}
 .verif .vlist{margin:0;padding-left:18px;font-size:12.5px;color:var(--ink);line-height:1.45}
 .verif .vlist li{margin:2px 0}
 .verif .vlist li.bad{color:var(--bad)}
+.vraw{margin-top:10px;font-size:12.5px}
+.vraw summary{cursor:pointer;color:var(--accent);font-size:12px}
+.vraw dl.kv{margin-top:8px;font-size:12px}
+.vraw .mono{font-size:11.5px;word-break:break-all;line-height:1.5}
 .selc{width:30px;padding-right:0}
 .selc input{width:15px;height:15px;accent-color:var(--accent);cursor:pointer;margin:0;vertical-align:middle}
 .bulkbar{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);
@@ -392,6 +396,10 @@ async function load(key, days){
     else ERR[n] = {message: res[i].reason.message, permission: !!res[i].reason.permission};
   });
   if (!D.account) throw new Error(ERR.account ? ERR.account.message : "Could not read the account");
+  // Capabilities carry their own requirements and disabled reason; Stripe sometimes records a
+  // restriction there and not on the account itself. Best effort: ignored if the key cannot read it.
+  try { D.caps = await sq(key, `accounts/${D.account.id}/capabilities`); }
+  catch(e){ ERR.caps = {message: e.message, permission: !!e.permission}; }
   return derive(key, days, D, ERR);
 }
 
@@ -537,6 +545,28 @@ function derive(key, days, D, ERR){
   const restrictedAt = restrictedEv ? restrictedEv.created : null;
   const acctEventsOldest = acctEv.length ? acctEv[acctEv.length - 1].created : null;
 
+  // Requirements from the account and from each capability, merged.
+  const capsDetail = list("caps").map(c => ({id:c.id, status:c.status, req:c.requirements || null}));
+  const capReq = k => capsDetail.flatMap(c => (c.req && c.req[k]) || []);
+  const R = a.requirements || {}, FR = a.future_requirements || {};
+  const uniq = l => [...new Set(l)];
+  const currentlyDue = uniq([...(R.currently_due||[]), ...capReq("currently_due")]);
+  const pastDue = uniq([...(R.past_due||[]), ...capReq("past_due")]);
+  const pendingVerification = uniq([...(R.pending_verification||[]), ...capReq("pending_verification")]);
+  const eventuallyDue = uniq([...(R.eventually_due||[]), ...capReq("eventually_due"), ...(FR.currently_due||[])]);
+  const reqErrors = [...(R.errors||[]), ...capReq("errors")].map(e => ({code:e.code, reason:e.reason, requirement:e.requirement}));
+  const deadlines = [R.current_deadline, ...capsDetail.map(c => c.req && c.req.current_deadline)].filter(Boolean);
+  const deadline = deadlines.length ? Math.min(...deadlines) : null;
+  const capDisabled = capsDetail.filter(c => c.req && c.req.disabled_reason).map(c => ({id:c.id, reason:c.req.disabled_reason}));
+  const disabledReason = R.disabled_reason || (capDisabled[0] && capDisabled[0].reason) || null;
+  // the account.updated event that switched charges or payouts off, with every attribute it changed
+  const switchEv = acctEv.find(ev => ev.data && ev.data.previous_attributes
+    && (ev.data.previous_attributes.payouts_enabled === true || ev.data.previous_attributes.charges_enabled === true));
+  const flat = (o, pre = "") => Object.entries(o || {}).flatMap(([k,v]) =>
+    (v && typeof v === "object" && !Array.isArray(v)) ? flat(v, pre + k + ".") : [[pre + k, v]]);
+  const getPath = (o, path) => path.split(".").reduce((x,k) => (x && typeof x === "object") ? x[k] : undefined, o);
+  const switchChanges = switchEv ? flat(switchEv.data.previous_attributes).map(([path, old]) => ({path, old, now: getPath(switchEv.data.object, path)})) : [];
+
   // settlement totals of succeeded charges in the window, in the currency Stripe settled them in
   const btOf = c => (c.balance_transaction && typeof c.balance_transaction === "object") ? c.balance_transaction : null;
   const settleMap = {};
@@ -565,13 +595,10 @@ function derive(key, days, D, ERR){
     detailsSubmitted: a.details_submitted,
     schedule: (S.payouts && S.payouts.schedule && S.payouts.schedule.interval) || "—",
     delayDays: S.payouts && S.payouts.schedule ? S.payouts.schedule.delay_days : null,
-    currentlyDue: (a.requirements && a.requirements.currently_due) || [],
-    pastDue: (a.requirements && a.requirements.past_due) || [],
-    deadline: a.requirements && a.requirements.current_deadline,
-    disabledReason: a.requirements && a.requirements.disabled_reason,
-    pendingVerification: (a.requirements && a.requirements.pending_verification) || [],
-    eventuallyDue: (a.requirements && a.requirements.eventually_due) || [],
-    reqErrors: ((a.requirements && a.requirements.errors) || []).map(e => ({code:e.code, reason:e.reason, requirement:e.requirement})),
+    currentlyDue, pastDue, deadline, disabledReason, pendingVerification, eventuallyDue, reqErrors,
+    capDisabled, capsDetail, capabilities: a.capabilities || {},
+    requirementsRaw: a.requirements || null, futureRequirementsRaw: a.future_requirements || null,
+    switchAt: switchEv ? switchEv.created : null, switchChanges,
     payoutsDisabledAt, chargesDisabledAt, restrictedAt, acctEventsOldest,
     bank,
     available: (D.balance && D.balance.available) || [],
@@ -804,15 +831,41 @@ function verification(A){
   return `<div class="verif"><div class="vh">Stripe verification</div>
     ${A.disabledReason ? `<p class="vwhy"><b>Why restricted:</b> ${esc(DISABLED_WHY[A.disabledReason] || lbl(A.disabledReason))}${
       A.restrictedAt ? ` <span class="muted">· since ${esc(dt(A.restrictedAt))}</span>` : ""}</p>` : ""}
-    ${nothing ? `<p class="note">Nothing outstanding. Stripe is not asking for any documents or information.</p>` : ""}
+    ${nothing ? (A.chargesEnabled === false || A.payoutsEnabled === false
+      ? `<p class="vwhy">Stripe has not listed any document or field for this restriction through the API. That usually means a manual
+          review: Stripe says what it wants in the Dashboard banner and by email to ${esc(A.email || "the account email")}, not through the API.</p>`
+      : `<p class="note">Nothing outstanding. Stripe is not asking for any documents or information.</p>`) : ""}
+    ${(A.capDisabled || []).length ? `<p class="vlab">Capabilities Stripe switched off</p><ul class="vlist">${A.capDisabled.map(c =>
+      `<li><b>${esc(lbl(c.id))}</b> — ${esc(DISABLED_WHY[c.reason] || lbl(c.reason))}</li>`).join("")}</ul>` : ""}
     ${due.length ? `<p class="vlab">Stripe needs now${A.deadline ? ` <span class="muted">· by ${esc(d8(A.deadline))}</span>` : ""}</p>
       <ul class="vlist">${due.map(x => `<li${past.includes(x) ? ' class="bad"' : ""}>${esc(x)}${past.includes(x) ? " <b>· overdue</b>" : ""}</li>`).join("")}</ul>` : ""}
     ${pend.length ? `<p class="vlab">Submitted, being checked by Stripe</p><ul class="vlist">${pend.map(x => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}
     ${errs.length ? `<p class="vlab">Problems Stripe reported</p><ul class="vlist">${errs.map(e =>
       `<li><b>${esc(reqLabel(e.requirement || ""))}</b> — ${esc(e.reason || lbl(e.code))}</li>`).join("")}</ul>` : ""}
     ${later.length ? `<p class="vlab muted">Needed later: ${esc(later.join(" · "))}</p>` : ""}
-    ${!nothing ? `<p class="note" style="margin-top:8px">Upload or fix these in the Stripe Dashboard (Settings → Account details, or the banner at the top of the Dashboard).</p>` : ""}
+    ${(due.length || pend.length || errs.length) ? `<p class="note" style="margin-top:8px">Upload or fix these in the Stripe Dashboard (Settings → Account details, or the banner at the top of the Dashboard).</p>` : ""}
+    ${recorded(A)}
   </div>`;
+}
+
+// Everything Stripe recorded about the restriction, folded away: capability statuses, the exact
+// attributes that changed when charges or payouts went off, and the raw requirement objects.
+const fmtVal = v => v === undefined ? "—" : v === null ? "null" : typeof v === "object" ? JSON.stringify(v) : String(v);
+function recorded(A){
+  const caps = Object.entries(A.capabilities || {});
+  const detail = A.capsDetail || [];
+  if (!caps.length && !detail.length && !A.switchAt && !A.requirementsRaw) return "";
+  return `<details class="vraw"><summary>What Stripe recorded</summary><dl class="kv">
+    ${caps.length ? `<dt>Capabilities</dt><dd>${caps.map(([k,v]) => `${esc(lbl(k))}: <b>${esc(v)}</b>`).join(" · ")}</dd>` : ""}
+    ${detail.length ? `<dt>Capability detail</dt><dd>${detail.map(c => `<div>${esc(lbl(c.id))}: <b>${esc(c.status)}</b>${
+      c.req && c.req.disabled_reason ? ` · ${esc(lbl(c.req.disabled_reason))}` : ""}${
+      c.req && (c.req.currently_due||[]).length ? ` · needs ${esc((c.req.currently_due||[]).map(reqLabel).join(", "))}` : ""}</div>`).join("")}</dd>` : ""}
+    ${A.switchAt ? `<dt>Switched off</dt><dd>${esc(dt(A.switchAt))}</dd>` : ""}
+    ${(A.switchChanges || []).length ? `<dt>Changed then</dt><dd>${A.switchChanges.map(c =>
+      `<div class="mono">${esc(c.path)}: ${esc(fmtVal(c.old))} → ${esc(fmtVal(c.now))}</div>`).join("")}</dd>` : ""}
+    <dt>Requirements</dt><dd class="mono">${esc(A.requirementsRaw ? JSON.stringify(A.requirementsRaw) : "none provided by Stripe for this account")}</dd>
+    ${A.futureRequirementsRaw ? `<dt>Future</dt><dd class="mono">${esc(JSON.stringify(A.futureRequirementsRaw))}</dd>` : ""}
+  </dl></details>`;
 }
 
 // "off since …" for the Account card. Stripe keeps 30 days of events, so an older switch-off has no exact time.
